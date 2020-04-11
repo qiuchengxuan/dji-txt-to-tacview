@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -12,6 +13,8 @@ import (
 
 	"github.com/qiuchengxuan/dji-txt-to-tacview/acmi"
 	. "github.com/qiuchengxuan/dji-txt-to-tacview/record"
+
+	. "github.com/googollee/eviltransform/go"
 )
 
 type Decoder struct {
@@ -77,7 +80,7 @@ func (d *detail) decode(readSeeker io.ReadSeeker) {
 	readSeeker.Seek(91, io.SeekCurrent)
 	readSeeker.Read(buffer[:24])
 	timestamp := *(*uint64)(unsafe.Pointer(&buffer[0]))
-	d.timestamp = time.Unix(int64(timestamp/1000), int64(timestamp%1000)*1000)
+	d.timestamp = time.Unix(int64(timestamp/1000), int64(timestamp%1000)*1000*1000)
 	d.longitude = *(*float64)(unsafe.Pointer(&buffer[8]))
 	d.latitude = *(*float64)(unsafe.Pointer(&buffer[16]))
 	readSeeker.Seek(28+137, io.SeekCurrent)
@@ -87,9 +90,14 @@ func (d *detail) decode(readSeeker io.ReadSeeker) {
 }
 
 func main() {
-	if len(os.Args) < 2 {
+	gcj02 := flag.Bool("gcj02", false, "Transform coordinates to GCJ-02")
+	filename := flag.String("i", "", "Input file")
+	flag.Parse()
+
+	if *filename == "" {
 		log.Fatal("Filename not provided")
 	}
+
 	f, err := os.Open(os.Args[len(os.Args)-1])
 	if err != nil {
 		log.Fatal(err)
@@ -162,14 +170,16 @@ func main() {
 				continue
 			}
 			w.Write([]byte(fmt.Sprintf("#%g\n", r.FlyTime())))
-			t := acmi.Transform{
-				Coordinate: acmi.Coordinate{
-					Longitude: r.Longitude(),
-					Latitude:  r.Latitude(),
-					Altitude:  r.Height() + homeHeight,
-				},
-				Attitude: &acmi.Attitude{Roll: r.Roll(), Pitch: r.Pitch(), Yaw: r.Yaw()},
+			c := acmi.Coordinate{
+				Longitude: r.Longitude(),
+				Latitude:  r.Latitude(),
+				Altitude:  r.Height() + homeHeight,
 			}
+			if *gcj02 {
+				c.Latitude, c.Longitude = WGStoGCJ(r.Latitude(), r.Longitude())
+			}
+			a := acmi.Attitude{Roll: r.Roll(), Pitch: r.Pitch(), Yaw: r.Yaw()}
+			t := acmi.Transform{Coordinate: c, Attitude: &a}
 			object := acmi.Object{Id: 1, Transform: t}
 			if firstOSD {
 				object.Name = detail.aircraftName
@@ -182,13 +192,11 @@ func main() {
 			if !r.Coodinate.Valid() {
 				continue
 			}
-			t := acmi.Transform{
-				Coordinate: acmi.Coordinate{
-					Longitude: r.Longitude(),
-					Latitude:  r.Latitude(),
-					Altitude:  r.Height(),
-				},
+			c := acmi.Coordinate{Longitude: r.Longitude(), Latitude: r.Latitude(), Altitude: r.Height()}
+			if *gcj02 {
+				c.Latitude, c.Longitude = WGStoGCJ(r.Latitude(), r.Longitude())
 			}
+			t := acmi.Transform{Coordinate: c}
 			object := acmi.Object{Id: 2, Transform: t}
 			if firstHome {
 				object.Name = "home"
