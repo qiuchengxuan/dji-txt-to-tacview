@@ -1,45 +1,17 @@
 package main
 
 import (
-	"encoding/binary"
-	"encoding/csv"
+	"bytes"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"reflect"
-	"strconv"
+	"time"
 	"unsafe"
 
+	"github.com/qiuchengxuan/dji-txt-to-tacview/acmi"
 	. "github.com/qiuchengxuan/dji-txt-to-tacview/record"
-	. "github.com/qiuchengxuan/dji-txt-to-tacview/unscramble"
-)
-
-const (
-	fieldTime int = iota
-	fieldLongitude
-	fieldLatitude
-	fieldAltitude
-	fieldRoll
-	fieldPitch
-	fieldYaw
-	fieldIAS
-)
-
-var fieldName []string = []string{
-	fieldTime:      "Time",
-	fieldLongitude: "Longitude",
-	fieldLatitude:  "Latitude",
-	fieldAltitude:  "Altitude",
-	fieldRoll:      "Roll (deg)",
-	fieldPitch:     "Pitch (deg)",
-	fieldYaw:       "Yaw (deg)",
-	fieldIAS:       "IAS",
-}
-
-const (
-	startOfImage = 0xFFD8
-	endOfImage   = 0xFFD9
 )
 
 type Decoder struct {
@@ -75,6 +47,7 @@ func (d *Decoder) Decode(x interface{}, options ...int) error {
 type appOsVersion = uint8
 
 const (
+	appOsVersionGO  appOsVersion = 6
 	appOsVersionFly appOsVersion = 12
 )
 
@@ -87,26 +60,30 @@ type header struct {
 
 const headerSize int = 100
 
-func handleJPEG(readSeeker io.ReadSeeker) (int64, error) {
-	size := 0
-	var bytes [2]byte
-	readSeeker.Read(bytes[:])
-	size += 2
-	if binary.BigEndian.Uint16(bytes[:]) == startOfImage {
-		for {
-			readSeeker.Read(bytes[:])
-			size += 2
-			if binary.BigEndian.Uint16(bytes[:]) != endOfImage {
-				continue
-			}
-			readSeeker.Read(bytes[:])
-			size += 2
-			if binary.BigEndian.Uint16(bytes[:]) != startOfImage {
-				break
-			}
-		}
-	}
-	return readSeeker.Seek(-2, io.SeekCurrent)
+type detail struct {
+	// ignore leading 91 bytes
+	timestamp time.Time
+	longitude float64
+	latitude  float64
+	// ignore following 28 bytes
+
+	// ignore leading 137 bytes
+	aircraftName string // 32 bytes
+	// ignore following 64 bytes
+}
+
+func (d *detail) decode(readSeeker io.ReadSeeker) {
+	var buffer [32]byte
+	readSeeker.Seek(91, io.SeekCurrent)
+	readSeeker.Read(buffer[:24])
+	timestamp := *(*uint64)(unsafe.Pointer(&buffer[0]))
+	d.timestamp = time.Unix(int64(timestamp/1000), int64(timestamp%1000)*1000)
+	d.longitude = *(*float64)(unsafe.Pointer(&buffer[8]))
+	d.latitude = *(*float64)(unsafe.Pointer(&buffer[16]))
+	readSeeker.Seek(28+137, io.SeekCurrent)
+	readSeeker.Read(buffer[:])
+	d.aircraftName = string(buffer[:bytes.IndexByte(buffer[:], 0)])
+	return
 }
 
 func main() {
@@ -126,79 +103,99 @@ func main() {
 		log.Fatal(err)
 	}
 
-	skip := headerSize - int(unsafe.Sizeof(header))
-	if header.appOsVersion == appOsVersionFly {
-		skip += int(header.detailsLength)
+	if header.appOsVersion < appOsVersionGO {
+		log.Fatal("Unsupported os version")
 	}
-	if _, err := decoder.Seek(int64(skip), io.SeekCurrent); err != nil {
+
+	w := acmi.AcmiWriter{Writer: os.Stdout}
+	w.WriteHeader()
+
+	var offset int64
+	if header.appOsVersion >= appOsVersionFly { // details follows header
+		offset = int64(headerSize)
+	} else {
+		offset = int64(header.endRecordOffset) + 1
+	}
+	if _, err := decoder.Seek(offset, io.SeekStart); err != nil {
+		log.Fatal(err)
+	}
+	var detail detail
+	detail.decode(decoder)
+
+	var dataRecorder string
+	if header.appOsVersion == appOsVersionFly {
+		dataRecorder = "DJI Fly"
+	} else {
+		dataRecorder = "DJI GO"
+	}
+	w.Dump(&acmi.ReferenceObject{
+		Longitude:     int(detail.longitude),
+		Latitude:      int(detail.latitude),
+		DataSource:    detail.aircraftName,
+		DataRecorder:  dataRecorder,
+		ReferenceTime: detail.timestamp,
+	})
+
+	if header.appOsVersion >= appOsVersionFly {
+		offset = int64(headerSize) + int64(header.detailsLength)
+	} else {
+		offset = int64(headerSize)
+	}
+	if _, err := decoder.Seek(int64(offset), io.SeekStart); err != nil {
 		log.Fatal(err)
 	}
 
-	w := csv.NewWriter(os.Stdout)
-	w.Write(fieldName)
+	firstOSD, firstHome := true, true
 
-	homeHeight := float64(0)
-	offset := 0
-	var buffer []byte
-	records := [fieldIAS + 1]string{}
-	for offset <= int(header.endRecordOffset) {
-		var record Record
-		if err := decoder.Decode(&record, 2); err != nil {
-			if err == io.EOF {
-				break
-			} else {
-				log.Fatal(err)
+	homeHeight := 0.0
+	recordReader := NewRecordReader(decoder)
+	for offset <= int64(header.endRecordOffset) {
+		record := recordReader.Next()
+		offset = recordReader.Offset()
+		if record == nil {
+			continue
+		}
+
+		switch r := record.(type) {
+		case *OSD:
+			if !r.Coodinate.Valid() {
+				continue
 			}
-		}
-
-		if record.Type == RecordTypeJPEG || (record.Type == 0xFF && record.Length == 0xD8) {
-			if record.Type == RecordTypeJPEG {
-				decoder.Seek(2, io.SeekCurrent)
-			} else { // old log JPEG formats
-				decoder.Seek(-2, io.SeekCurrent)
+			w.Write([]byte(fmt.Sprintf("#%g\n", r.FlyTime())))
+			t := acmi.Transform{
+				Coordinate: acmi.Coordinate{
+					Longitude: r.Longitude(),
+					Latitude:  r.Latitude(),
+					Altitude:  r.Height() + homeHeight,
+				},
+				Attitude: &acmi.Attitude{Roll: r.Roll(), Pitch: r.Pitch(), Yaw: r.Yaw()},
 			}
-			off, _ := handleJPEG(decoder)
-			offset = int(off)
-			continue
+			object := acmi.Object{Id: 1, Transform: t}
+			if firstOSD {
+				object.Name = detail.aircraftName
+				object.Type = acmi.ObjectTypeAirRotorcraft
+				firstOSD = false
+			}
+			w.Dump(&object)
+		case *Home:
+			homeHeight = r.Height()
+			if !r.Coodinate.Valid() {
+				continue
+			}
+			t := acmi.Transform{
+				Coordinate: acmi.Coordinate{
+					Longitude: r.Longitude(),
+					Latitude:  r.Latitude(),
+					Altitude:  r.Height(),
+				},
+			}
+			object := acmi.Object{Id: 2, Transform: t}
+			if firstHome {
+				object.Name = "home"
+				object.Type = acmi.ObjectTypeHuman
+				firstHome = false
+			}
+			w.Dump(&object)
 		}
-
-		readSize := int(record.Length) + 1 // including end-of-record
-		if len(buffer) < readSize {
-			buffer = make([]byte, readSize)
-		}
-		decoder.Read(buffer[:readSize])
-		recordBytes := buffer[:record.Length]
-		Unscramble(recordBytes, record.Type)
-
-		for buffer[record.Length] != 0xFF { // locating end-of-record
-			decoder.Read(buffer[record.Length:readSize])
-		}
-		off, _ := decoder.Seek(0, io.SeekCurrent)
-		offset = int(off)
-
-		if record.Type != RecordTypeOSD && record.Type != RecordTypeHome {
-			continue
-		}
-
-		if record.Type == RecordTypeHome {
-			homeHeight = (*Home)(unsafe.Pointer(&recordBytes[0])).Height()
-			continue
-		}
-
-		osd := (*OSD)(unsafe.Pointer(&recordBytes[0]))
-		if osd.Longitude() == 0 || osd.Latitude() == 0 {
-			continue
-		}
-
-		records[fieldTime] = strconv.FormatFloat(osd.FlyTime(), 'f', -1, 64)
-		records[fieldLongitude] = fmt.Sprintf("%f", osd.Longitude())
-		records[fieldLatitude] = fmt.Sprintf("%f", osd.Latitude())
-		records[fieldAltitude] = strconv.FormatFloat(osd.Height()+homeHeight, 'f', -1, 64)
-		records[fieldRoll] = strconv.FormatFloat(osd.Roll(), 'f', -1, 64)
-		records[fieldPitch] = strconv.FormatFloat(osd.Pitch(), 'f', -1, 64)
-		records[fieldYaw] = strconv.FormatFloat(osd.Yaw(), 'f', -1, 64)
-		records[fieldIAS] = strconv.FormatFloat(osd.Speed(), 'f', -1, 64)
-		w.Write(records[:])
 	}
-	w.Flush()
 }
